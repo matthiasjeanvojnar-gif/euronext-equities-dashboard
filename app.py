@@ -6,9 +6,7 @@ Bloomberg-inspired dark theme, data-centric, table-first.
 """
 
 import os
-import shutil
 import datetime
-import requests
 
 import streamlit as st
 import pandas as pd
@@ -29,6 +27,13 @@ from storage_utils import (
     load_market_history,
     load_group_history,
     aggregate_time,
+)
+from download_utils import (
+    download_latest_snapshot,
+    is_valid_xlsx,
+    LATEST_FILE,
+    DATA_DIR,
+    ARCHIVE_DIR,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -158,25 +163,6 @@ def apply_plotly_theme(fig):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Constants
-# ═══════════════════════════════════════════════════════════════════════════
-
-DATA_DIR = "data"
-LATEST_FILE = os.path.join(DATA_DIR, "latest_equities.xlsx")
-ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")
-
-# Euronext direct download endpoint
-EURONEXT_DOWNLOAD_URL = (
-    "https://live.euronext.com/en/pd/data/stocks"
-    "?mics=XAMS,XBRU,XDUB,XLIS,XPAR,XMIL,XOSL,ALXB,ALXL,ALXP,ENXB,ENXL,ENXM,VPXB,MLXB,TNLA,TNLB,EXGM,BGEM,MTAH,ETLX"
-    "&op=&tp=&export=true"
-)
-
-# Alt: fallback endpoint
-EURONEXT_ALT_URL = "https://live.euronext.com/en/pd/data/stocks?mics=XAMS,XBRU,XDUB,XLIS,XPAR,XMIL,XOSL,ALXB,ALXL,ALXP,ENXB,ENXL,ENXM,VPXB&op=&tp=&export=true"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Session state init
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -191,6 +177,7 @@ def init_state():
         "latest_trade": None,
         "refresh_time": None,
         "fx_info": None,
+        "download_method": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -200,107 +187,98 @@ init_state()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Download logic
-# ═══════════════════════════════════════════════════════════════════════════
-
-def download_euronext_excel() -> str | None:
-    """Download latest Excel from Euronext. Returns filepath or None."""
-    ensure_dirs()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel, */*",
-        "Referer": "https://live.euronext.com/en/products/equities/list",
-    }
-
-    for url in [EURONEXT_DOWNLOAD_URL, EURONEXT_ALT_URL]:
-        try:
-            resp = requests.get(url, headers=headers, timeout=60, stream=True)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                # Save latest
-                with open(LATEST_FILE, "wb") as f:
-                    f.write(resp.content)
-                # Archive copy
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                archive_path = os.path.join(ARCHIVE_DIR, f"equities_{ts}.xlsx")
-                shutil.copy2(LATEST_FILE, archive_path)
-                return LATEST_FILE
-        except Exception:
-            continue
-
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Core refresh logic
+# Core refresh logic (uses download_utils pipeline)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def refresh_data(fx_info: dict):
-    """Download, parse, compute, store."""
-    # 1. Download
-    filepath = None
-    with st.spinner("Downloading from Euronext…"):
-        filepath = download_euronext_excel()
+    """Download, validate, parse, compute, store."""
+    status_area = st.empty()
 
-    if filepath is None:
-        if os.path.exists(LATEST_FILE):
-            st.warning("Download failed — using last available file.")
-            filepath = LATEST_FILE
-        else:
-            st.error("Download failed and no cached file available.")
-            return
+    def _progress(msg: str):
+        status_area.info(f"⟳ {msg}")
 
-    # 2. Parse
-    with st.spinner("Processing data…"):
-        try:
-            df, snapshot_time = parse_euronext_excel(filepath)
-        except Exception as e:
-            st.error(f"Parsing error: {e}")
-            return
+    # ── 1. Download with validation ──
+    _progress("Starting download…")
+    result = download_latest_snapshot(progress_callback=_progress)
 
-        if df.empty:
-            st.error("Parsed file contains no data.")
-            return
+    if not result.ok:
+        status_area.empty()
+        st.error(result.error or "Download failed.")
+        return
 
-        if snapshot_time is None:
-            snapshot_time = datetime.datetime.now()
+    if result.method == "cache":
+        st.warning("⚠ " + (result.error or "Using last available valid snapshot."))
 
-        # Snapshot status
-        prev = st.session_state.get("last_snapshot_time")
-        if prev is None:
-            st.session_state["snapshot_status"] = "first"
-        elif prev == snapshot_time:
-            st.session_state["snapshot_status"] = "same"
-        else:
-            st.session_state["snapshot_status"] = "new"
-        st.session_state["last_snapshot_time"] = snapshot_time
+    filepath = result.filepath
+    st.session_state["download_method"] = result.method
 
-        # 3. Compute
-        fx_rate = fx_info["rate"]
-        market_summary = compute_market_summary(df, fx_rate)
-        group_summary = compute_group_summary(market_summary)
+    # ── 2. Final validation gate (belt & suspenders) ──
+    if not is_valid_xlsx(filepath):
+        status_area.empty()
+        st.error(
+            "Downloaded file is not a valid Excel (.xlsx) file. "
+            "The response may have been an HTML page or redirect."
+        )
+        return
 
-        # Latest trade
-        if "last_trade_mic_time_parsed" in df.columns:
-            valid = df["last_trade_mic_time_parsed"].dropna()
-            latest_trade = valid.max() if len(valid) > 0 else None
-        else:
-            latest_trade = None
+    # ── 3. Parse ──
+    _progress("Processing data…")
+    try:
+        df, snapshot_time = parse_euronext_excel(filepath)
+    except Exception as e:
+        status_area.empty()
+        st.error(f"Parsing error: {e}")
+        return
 
-        # 4. Store history
-        try:
-            save_market_snapshot(snapshot_time, market_summary, fx_rate, latest_trade)
-            save_group_snapshot(snapshot_time, group_summary)
-        except Exception:
-            pass  # non-critical
+    if df.empty:
+        status_area.empty()
+        st.error("Parsed file contains no instrument data.")
+        return
 
-        # 5. Update state
-        st.session_state["df"] = df
-        st.session_state["snapshot_time"] = snapshot_time
-        st.session_state["market_summary"] = market_summary
-        st.session_state["group_summary"] = group_summary
-        st.session_state["latest_trade"] = latest_trade
-        st.session_state["refresh_time"] = datetime.datetime.now()
-        st.session_state["fx_info"] = fx_info
+    if snapshot_time is None:
+        snapshot_time = datetime.datetime.now()
+
+    # Snapshot status
+    prev = st.session_state.get("last_snapshot_time")
+    if prev is None:
+        st.session_state["snapshot_status"] = "first"
+    elif prev == snapshot_time:
+        st.session_state["snapshot_status"] = "same"
+    else:
+        st.session_state["snapshot_status"] = "new"
+    st.session_state["last_snapshot_time"] = snapshot_time
+
+    # ── 4. Compute ──
+    fx_rate = fx_info["rate"]
+    market_summary = compute_market_summary(df, fx_rate)
+    group_summary = compute_group_summary(market_summary)
+
+    # Latest trade
+    if "last_trade_mic_time_parsed" in df.columns:
+        valid = df["last_trade_mic_time_parsed"].dropna()
+        latest_trade = valid.max() if len(valid) > 0 else None
+    else:
+        latest_trade = None
+
+    # ── 5. Store history ──
+    try:
+        save_market_snapshot(snapshot_time, market_summary, fx_rate, latest_trade)
+        save_group_snapshot(snapshot_time, group_summary)
+    except Exception:
+        pass  # non-critical
+
+    # ── 6. Update state ──
+    st.session_state["df"] = df
+    st.session_state["snapshot_time"] = snapshot_time
+    st.session_state["market_summary"] = market_summary
+    st.session_state["group_summary"] = group_summary
+    st.session_state["latest_trade"] = latest_trade
+    st.session_state["refresh_time"] = datetime.datetime.now()
+    st.session_state["fx_info"] = fx_info
+
+    status_area.empty()
+    method_label = {"direct": "Direct HTTP", "playwright": "Browser export", "cache": "Cached file"}
+    st.success(f"✓ Data loaded via {method_label.get(result.method, result.method)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
